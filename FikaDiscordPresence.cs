@@ -137,13 +137,11 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
                 }
                 catch (TaskCanceledException)
                 {
-                    logger.Error("Fika API request timed out. Stopping mod updates.");
-                    return;
+                    logger.Warning($"Fika API request timed out. Will retry in {config.Update.IntervalSeconds} seconds.");
                 }
                 catch (HttpRequestException ex)
                 {
-                    logger.Error($"Fika API request failed: {ex.Message}. Stopping mod updates.");
-                    return;
+                    logger.Warning($"Fika API request failed: {ex.Message}. Will retry in {config.Update.IntervalSeconds} seconds.");
                 }
                 catch (Exception e)
                 {
