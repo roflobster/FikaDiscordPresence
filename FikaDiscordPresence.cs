@@ -1,8 +1,8 @@
 using SPTarkov.DI.Annotations;
 using SPTarkov.Server.Core.DI;
-using SPTarkov.Server.Core.Helpers;
+using SPTarkov.Server.Core.Helpers.Server;
 using SPTarkov.Server.Core.Models.Spt.Mod;
-using SPTarkov.Server.Core.Models.Utils;
+using SPTarkov.Common.Models.Logging;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
@@ -13,22 +13,22 @@ using System.Net.Http.Headers;
 
 namespace _FikaDiscordPresence;
 
-public record ModMetadata : AbstractModMetadata
+public record ModMetadata : IModMetadata
 {
-    public override string ModGuid { get; init; } = "com.fiodor.fikadiscordpresence";
-    public override string Name { get; init; } = "Fika Discord Presence";
-    public override string Author { get; init; } = "Fiodor";
-    public override List<string>? Contributors { get; init; }
-    public override SemanticVersioning.Version Version { get; init; } = new("1.0.3");
-    public override SemanticVersioning.Range SptVersion { get; init; } = new("~4.0.0");
-    public override List<string>? Incompatibilities { get; init; }
-    public override Dictionary<string, SemanticVersioning.Range>? ModDependencies { get; init; }
-    public override string? Url { get; init; }
-    public override bool? IsBundleMod { get; init; }
-    public override string License { get; init; } = "MIT";
+    public string ModGuid { get; init; } = "com.fiodor.fikadiscordpresence";
+    public string Name { get; init; } = "Fika Discord Presence";
+    public string Author { get; init; } = "Fiodor";
+    public List<string>? Contributors { get; init; }
+    public SemanticVersioning.Version Version { get; init; } = new("1.0.3");
+    public SemanticVersioning.Range SptVersion { get; init; } = new("~4.1.0");
+    public bool HasPrepatcher { get; init; } = false;
+    public List<string>? Incompatibilities { get; init; }
+    public Dictionary<string, SemanticVersioning.Range>? ModDependencies { get; init; }
+    public string? Url { get; init; }
+    public string License { get; init; } = "MIT";
 }
 
-[Injectable(TypePriority = int.MaxValue)]
+[Injectable(TypePriority = OnLoadOrder.PostLoad)]
 public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelper) : IOnLoad
 {
     private const string StateFileName = "message_Id.json";
@@ -55,7 +55,10 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
 
         if (config.LogMonitor.Enabled)
         {
-            var logPath = GetDefaultLogFolderFromModPath(modHelper.GetAbsolutePathToModFolder(Assembly.GetExecutingAssembly()));
+            var logPath = string.IsNullOrWhiteSpace(config.LogMonitor.LogFolderPath)
+                ? GetDefaultLogFolderFromModPath(modHelper.GetAbsolutePathToModFolder(Assembly.GetExecutingAssembly()))
+                : config.LogMonitor.LogFolderPath;
+
             if (string.IsNullOrWhiteSpace(logPath))
                 errors.Add("LogMonitor enabled but could not resolve default log folder path.");
             else if (!Directory.Exists(logPath))
@@ -73,7 +76,7 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
         return true;
     }
 
-    public Task OnLoad()
+    public Task OnLoadAsync(CancellationToken cancellationToken)
     {
         var pathToMod = modHelper.GetAbsolutePathToModFolder(Assembly.GetExecutingAssembly());
         var config = modHelper.GetJsonDataFromFile<ModConfig>(pathToMod, "config.json");
@@ -86,14 +89,14 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
 
         _ = Task.Run(async () =>
         {
-            try { await RunLoop(logger, pathToMod, config); }
+            try { await RunLoop(logger, pathToMod, config, cancellationToken); }
             catch (Exception e) { logger.Error($"RunLoop error: {e}"); }
-        });
+        }, cancellationToken);
 
         return Task.CompletedTask;
     }
 
-    private async Task RunLoop(ISptLogger<ReadJsonConfig> logger, string pathToMod, ModConfig initialConfig)
+    private async Task RunLoop(ISptLogger<ReadJsonConfig> logger, string pathToMod, ModConfig initialConfig, CancellationToken cancellationToken)
     {
         var config = initialConfig;
         var configPath = Path.Combine(pathToMod, "config.json");
@@ -107,7 +110,9 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
         HttpClient http = CreateHttpClient();
         LogMonitorLite? logMon = null;
         bool logMonEnabled = config.LogMonitor.Enabled;
-        string resolvedLogPath = GetDefaultLogFolderFromModPath(pathToMod);
+        string resolvedLogPath = string.IsNullOrWhiteSpace(config.LogMonitor.LogFolderPath)
+            ? GetDefaultLogFolderFromModPath(pathToMod)
+            : config.LogMonitor.LogFolderPath;
 
         if (config.LogMonitor.Enabled && Directory.Exists(resolvedLogPath))
         {
@@ -116,7 +121,7 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
 
         try
         {
-            while (true)
+            while (!cancellationToken.IsCancellationRequested)
             {
                 config = ReloadConfig(configPath, config, logger);
                 logMon = UpdateLogMonitor(logMon, config, ref logMonEnabled, resolvedLogPath, logger);
@@ -128,15 +133,16 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
                 {
                     logMon?.Poll();
 
-                    var players = await GetOnlinePlayers(http, baseUrl, fikaHeaders);
-                    var presence = await GetPresence(http, baseUrl, fikaHeaders);
+                    var players = await GetOnlinePlayers(http, baseUrl, fikaHeaders, cancellationToken);
+                    var presence = await GetPresence(http, baseUrl, fikaHeaders, cancellationToken);
                     var presenceByNick = BuildPresenceDict(presence);
                     var embed = RenderEmbed(config, players, presenceByNick, logMon?.WeeklyBoss, logMon?.WeeklyBossMap);
 
-                    statusMessageId = await UpdateDiscordMessage(http, config, embed, statusMessageId, state, statePath);
+                    statusMessageId = await UpdateDiscordMessage(http, config, embed, statusMessageId, state, statePath, cancellationToken);
                 }
                 catch (TaskCanceledException)
                 {
+                    if (cancellationToken.IsCancellationRequested) break;
                     logger.Warning($"Fika API request timed out. Will retry in {config.Update.IntervalSeconds} seconds.");
                 }
                 catch (HttpRequestException ex)
@@ -148,7 +154,11 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
                     logger.Error($"Update error: {e}");
                 }
 
-                await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, config.Update.IntervalSeconds)));
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(Math.Max(1, config.Update.IntervalSeconds)), cancellationToken);
+                }
+                catch (TaskCanceledException) { break; }
             }
         }
         finally
@@ -191,11 +201,11 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
     }
 
     private async Task<ulong?> UpdateDiscordMessage(HttpClient http, ModConfig config, EmbedPayload embed, 
-        ulong? currentId, BotState state, string statePath)
+        ulong? currentId, BotState state, string statePath, CancellationToken cancellationToken)
     {
         if (currentId is null || currentId == 0)
         {
-            var created = await WebhookCreateMessage(http, config, embed);
+            var created = await WebhookCreateMessage(http, config, embed, cancellationToken);
             if (ulong.TryParse(created.Id, out var mid) && mid > 0)
             {
                 if (config.Discord.StatusMessageId <= 0)
@@ -210,7 +220,7 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
 
         try
         {
-            await WebhookEditMessage(http, config, currentId.Value, embed);
+            await WebhookEditMessage(http, config, currentId.Value, embed, cancellationToken);
             return currentId;
         }
         catch (HttpRequestException ex) when (ex.Message.Contains("404"))
@@ -388,13 +398,14 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
         catch { return ""; }
     }
 
-    private async Task<T> FikaRequest<T>(HttpClient http, string endpoint, string baseUrl, AuthenticationHeaderValue auth)
+    private async Task<T> FikaRequest<T>(HttpClient http, string endpoint, string baseUrl, AuthenticationHeaderValue auth, CancellationToken cancellationToken)
     {
         using var req = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}{endpoint}");
         req.Headers.Authorization = auth;
         req.Headers.Add("responsecompressed", "0");
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(TimeoutSeconds));
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(TimeoutSeconds));
         using var resp = await http.SendAsync(req, cts.Token);
         resp.EnsureSuccessStatusCode();
 
@@ -402,9 +413,9 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
         return JsonSerializer.Deserialize<T>(json, _jsonOpts)!;
     }
 
-    private async Task<List<OnlinePlayer>> GetOnlinePlayers(HttpClient http, string baseUrl, AuthenticationHeaderValue auth)
+    private async Task<List<OnlinePlayer>> GetOnlinePlayers(HttpClient http, string baseUrl, AuthenticationHeaderValue auth, CancellationToken cancellationToken)
     {
-        var data = await FikaRequest<PlayersResponse>(http, "/fika/api/players", baseUrl, auth);
+        var data = await FikaRequest<PlayersResponse>(http, "/fika/api/players", baseUrl, auth, cancellationToken);
         return data?.Players?.Select(p => new OnlinePlayer
         {
             ProfileId = p.ProfileId ?? "",
@@ -413,13 +424,14 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
         }).ToList() ?? [];
     }
 
-    private async Task<List<PresenceEntry>> GetPresence(HttpClient http, string baseUrl, AuthenticationHeaderValue auth)
+    private async Task<List<PresenceEntry>> GetPresence(HttpClient http, string baseUrl, AuthenticationHeaderValue auth, CancellationToken cancellationToken)
     {
         using var req = new HttpRequestMessage(HttpMethod.Get, $"{baseUrl}/fika/presence/get");
         req.Headers.Authorization = auth;
         req.Headers.Add("responsecompressed", "0");
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(TimeoutSeconds));
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(TimeoutSeconds));
         using var resp = await http.SendAsync(req, cts.Token);
         resp.EnsureSuccessStatusCode();
 
@@ -455,7 +467,7 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
         return outList;
     }
 
-    private async Task<WebhookMessage> WebhookCreateMessage(HttpClient http, ModConfig config, EmbedPayload embed)
+    private async Task<WebhookMessage> WebhookCreateMessage(HttpClient http, ModConfig config, EmbedPayload embed, CancellationToken cancellationToken)
     {
         var url = (config.Discord.WebhookUrl ?? "").Trim();
         var postUrl = $"{url}{(url.Contains('?') ? "&" : "?")}wait=true";
@@ -470,7 +482,8 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
         };
 
         var body = JsonSerializer.Serialize(payload, _jsonOpts);
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(TimeoutSeconds));
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(TimeoutSeconds));
         using var resp = await http.PostAsync(postUrl, new StringContent(body, Encoding.UTF8, "application/json"), cts.Token);
         resp.EnsureSuccessStatusCode();
 
@@ -478,7 +491,7 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
         return JsonSerializer.Deserialize<WebhookMessage>(json, _jsonOpts) ?? new();
     }
 
-    private async Task WebhookEditMessage(HttpClient http, ModConfig config, ulong messageId, EmbedPayload embed)
+    private async Task WebhookEditMessage(HttpClient http, ModConfig config, ulong messageId, EmbedPayload embed, CancellationToken cancellationToken)
     {
         var patchUrl = $"{(config.Discord.WebhookUrl ?? "").Trim().TrimEnd('/')}/messages/{messageId}";
 
@@ -497,7 +510,8 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
             Content = new StringContent(body, Encoding.UTF8, "application/json")
         };
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(TimeoutSeconds));
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(TimeoutSeconds));
         using var resp = await http.SendAsync(req, cts.Token);
         resp.EnsureSuccessStatusCode();
     }
@@ -556,7 +570,7 @@ public record FikaConfig
 }
 
 public record UpdateConfig { public int IntervalSeconds { get; set; } = 30; }
-public record LogMonitorConfig { public bool Enabled { get; set; }  public int TimezoneOffsetHours { get; set; } }
+public record LogMonitorConfig { public bool Enabled { get; set; }  public int TimezoneOffsetHours { get; set; } public string? LogFolderPath { get; set; } }
 
 public record TextConfig
 {
@@ -680,7 +694,7 @@ public class LogMonitorLite : IDisposable
     {
         if (string.IsNullOrWhiteSpace(_logFolderPath) || !Directory.Exists(_logFolderPath)) return null;
 
-        var files = Directory.GetFiles(_logFolderPath, "spt*.log");
+        var files = Directory.GetFiles(_logFolderPath, "*.log");
         if (files.Length == 0) return null;
 
         return files.OrderByDescending(File.GetLastWriteTimeUtc).FirstOrDefault();
@@ -712,24 +726,26 @@ public class LogMonitorLite : IDisposable
 
     private void ProcessLine(string line, bool initialLoad)
     {
-        if (line.Contains("Weekly Boss:") && line.Contains("_botplacementsystem"))
+        if (line.Contains("Weekly Boss:", StringComparison.OrdinalIgnoreCase))
         {
-            var m = Regex.Match(line, @"Weekly Boss:\s+(boss\w+)\s+\|\s+\d+%\s+Chance\s+on\s+(\w+)", RegexOptions.CultureInvariant);
+            var m = Regex.Match(line, @"Weekly Boss:\s+(boss\w+)\s+\|\s+\d+%\s+Chance\s+on\s+(\w+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
             if (m.Success)
             {
                 WeeklyBoss = m.Groups[1].Value;
                 WeeklyBossMap = m.Groups[2].Value;
+                return;
             }
-            return;
         }
 
-        if (!line.Contains(" is boss of the week", StringComparison.OrdinalIgnoreCase)) return;
-
-        var m2 = Regex.Match(line, @"\b(boss\w+)\b\s+is\s+boss\s+of\s+the\s+week\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-        if (!m2.Success || (!string.IsNullOrWhiteSpace(WeeklyBoss) && !string.IsNullOrWhiteSpace(WeeklyBossMap))) return;
-
-        WeeklyBoss = m2.Groups[1].Value;
-        WeeklyBossMap = BossToMapKey.TryGetValue(WeeklyBoss, out var mapKey) ? mapKey : null;
+        if (line.Contains(" is boss of the week", StringComparison.OrdinalIgnoreCase))
+        {
+            var m2 = Regex.Match(line, @"\b(boss\w+)\b\s+is\s+boss\s+of\s+the\s+week\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            if (m2.Success && (string.IsNullOrWhiteSpace(WeeklyBoss) || string.IsNullOrWhiteSpace(WeeklyBossMap)))
+            {
+                WeeklyBoss = m2.Groups[1].Value;
+                WeeklyBossMap = BossToMapKey.TryGetValue(WeeklyBoss, out var mapKey) ? mapKey : null;
+            }
+        }
     }
 
     public void Dispose()

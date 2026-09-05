@@ -1,4 +1,5 @@
 {
+  // Comment to test
   // Master on/off switch for the mod.
   // true  = mod runs and posts/edits the Discord message
   // false = mod does nothing (but still loads)
