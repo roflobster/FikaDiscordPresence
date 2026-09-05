@@ -35,6 +35,7 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
     private const bool DiscordTts = false;
     private const bool IgnoreSslErrors = true;
     private const int TimeoutSeconds = 10;
+    private DateTime _lastConfigWriteTime = DateTime.MinValue;
 
     private readonly JsonSerializerOptions _jsonOpts = new()
     {
@@ -121,13 +122,21 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
 
         try
         {
+            string baseUrl = (config.Fika.BaseUrl ?? "").Trim().TrimEnd('/');
+            var fikaHeaders = new AuthenticationHeaderValue("Bearer", config.Fika.ApiKey ?? "");
+            ModConfig lastConfig = config;
+
             while (!cancellationToken.IsCancellationRequested)
             {
                 config = ReloadConfig(configPath, config, logger);
-                logMon = UpdateLogMonitor(logMon, config, ref logMonEnabled, resolvedLogPath, logger);
+                if (!ReferenceEquals(config, lastConfig))
+                {
+                    baseUrl = (config.Fika.BaseUrl ?? "").Trim().TrimEnd('/');
+                    fikaHeaders = new AuthenticationHeaderValue("Bearer", config.Fika.ApiKey ?? "");
+                    lastConfig = config;
+                }
 
-                string baseUrl = (config.Fika.BaseUrl ?? "").Trim().TrimEnd('/');
-                var fikaHeaders = new AuthenticationHeaderValue("Bearer", config.Fika.ApiKey ?? "");
+                logMon = UpdateLogMonitor(logMon, config, ref logMonEnabled, resolvedLogPath, logger);
 
                 try
                 {
@@ -172,9 +181,17 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
     {
         try
         {
+            var lastWrite = File.GetLastWriteTimeUtc(configPath);
+            if (lastWrite <= _lastConfigWriteTime) return current;
+
             var json = File.ReadAllText(configPath, Encoding.UTF8);
             var reloaded = JsonSerializer.Deserialize<ModConfig>(json, _jsonOpts);
-            return reloaded ?? current;
+            if (reloaded != null)
+            {
+                _lastConfigWriteTime = lastWrite;
+                return reloaded;
+            }
+            return current;
         }
         catch (Exception ex)
         {
@@ -652,6 +669,9 @@ public class LogMonitorLite : IDisposable
     public string? WeeklyBoss { get; private set; }
     public string? WeeklyBossMap { get; private set; }
 
+    private static readonly Regex _weeklyBossRegex = new(@"Weekly Boss:\s+(boss\w+)\s+\|\s+\d+%\s+Chance\s+on\s+(\w+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly Regex _bossOfTheWeekRegex = new(@"\b(boss\w+)\b\s+is\s+boss\s+of\s+the\s+week\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
     private static readonly Dictionary<string, string> BossToMapKey = new(StringComparer.OrdinalIgnoreCase)
     {
         ["bossBully"] = "bigmap",
@@ -728,7 +748,7 @@ public class LogMonitorLite : IDisposable
     {
         if (line.Contains("Weekly Boss:", StringComparison.OrdinalIgnoreCase))
         {
-            var m = Regex.Match(line, @"Weekly Boss:\s+(boss\w+)\s+\|\s+\d+%\s+Chance\s+on\s+(\w+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            var m = _weeklyBossRegex.Match(line);
             if (m.Success)
             {
                 WeeklyBoss = m.Groups[1].Value;
@@ -739,7 +759,7 @@ public class LogMonitorLite : IDisposable
 
         if (line.Contains(" is boss of the week", StringComparison.OrdinalIgnoreCase))
         {
-            var m2 = Regex.Match(line, @"\b(boss\w+)\b\s+is\s+boss\s+of\s+the\s+week\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            var m2 = _bossOfTheWeekRegex.Match(line);
             if (m2.Success && (string.IsNullOrWhiteSpace(WeeklyBoss) || string.IsNullOrWhiteSpace(WeeklyBossMap)))
             {
                 WeeklyBoss = m2.Groups[1].Value;
