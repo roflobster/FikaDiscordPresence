@@ -1,5 +1,4 @@
 {
-  // Comment to test
   // Master on/off switch for the mod.
   // true  = mod runs and posts/edits the Discord message
   // false = mod does nothing (but still loads)
@@ -69,6 +68,7 @@
     // Shown when no players are online.
     // Discord supports Markdown in embeds.
     "NoOnlineDescription": "🌵💨 _No one is online right now._",
+    "ServerOfflineDescription": "🔴 _Server is offline._",
 
     // Section titles + empty messages.
     "InRaidTitle": "⚔️ In Raid",

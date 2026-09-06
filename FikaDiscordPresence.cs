@@ -125,6 +125,7 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
             string baseUrl = (config.Fika.BaseUrl ?? "").Trim().TrimEnd('/');
             var fikaHeaders = new AuthenticationHeaderValue("Bearer", config.Fika.ApiKey ?? "");
             ModConfig lastConfig = config;
+            bool wasOffline = false;
 
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -148,15 +149,34 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
                     var embed = RenderEmbed(config, players, presenceByNick, logMon?.WeeklyBoss, logMon?.WeeklyBossMap);
 
                     statusMessageId = await UpdateDiscordMessage(http, config, embed, statusMessageId, state, statePath, cancellationToken);
+                    wasOffline = false;
                 }
                 catch (TaskCanceledException)
                 {
                     if (cancellationToken.IsCancellationRequested) break;
                     logger.Warning($"Fika API request timed out. Will retry in {config.Update.IntervalSeconds} seconds.");
+                    try 
+                    {
+                        if (!wasOffline)
+                        {
+                            var offlineEmbed = RenderOfflineEmbed(config);
+                            statusMessageId = await UpdateDiscordMessage(http, config, offlineEmbed, statusMessageId, state, statePath, cancellationToken);
+                            wasOffline = true;
+                        }
+                    } catch { }
                 }
                 catch (HttpRequestException ex)
                 {
                     logger.Warning($"Fika API request failed: {ex.Message}. Will retry in {config.Update.IntervalSeconds} seconds.");
+                    try 
+                    {
+                        if (!wasOffline)
+                        {
+                            var offlineEmbed = RenderOfflineEmbed(config);
+                            statusMessageId = await UpdateDiscordMessage(http, config, offlineEmbed, statusMessageId, state, statePath, cancellationToken);
+                            wasOffline = true;
+                        }
+                    } catch { }
                 }
                 catch (Exception e)
                 {
@@ -397,6 +417,19 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
         return embed;
     }
 
+    private EmbedPayload RenderOfflineEmbed(ModConfig config)
+    {
+        return new EmbedPayload
+        {
+            Title = config.Text.Title,
+            Color = config.Colors.EmbedColorDecimal,
+            Fields = [
+                new() { Name = "\u200b", Value = config.Text.ServerOfflineDescription, Inline = false }
+            ],
+            Footer = new() { Text = $"{config.Text.FooterPrefix} {DateTime.Now:yyyy-MM-dd HH:mm:ss}" }
+        };
+    }
+
     private static string FmtSince(long startedTs)
     {
         if (startedTs <= 0) return "";
@@ -593,6 +626,7 @@ public record TextConfig
 {
     public string Title { get; set; } = "Fika Server Status";
     public string NoOnlineDescription { get; set; } = "🌵💨 _No one is online right now._";
+    public string ServerOfflineDescription { get; set; } = "🔴 _Server is offline._";
     public string InRaidTitle { get; set; } = "⚔️ In Raid";
     public string InRaidEmpty { get; set; } = "_Nobody currently in raid._";
     public string OutOfRaidTitle { get; set; } = "🧩 Playing Tetris";
