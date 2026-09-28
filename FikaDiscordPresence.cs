@@ -275,15 +275,29 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
         return new HttpClient(httpHandler);
     }
 
-    private string GetConfigValue(Dictionary<string, string> dict, string key, string fallback) =>
-        dict.TryGetValue(key, out var value) ? value : fallback;
+    private static string GetConfigValue(Dictionary<string, string> dict, string key, string fallback)
+    {
+        if (dict.TryGetValue(key, out var value)) return value;
+        foreach (var (k, v) in dict)
+        {
+            if (string.Equals(k, key, StringComparison.OrdinalIgnoreCase))
+                return v;
+        }
+        return fallback;
+    }
 
     private string GetBossDisplay(ModConfig config, string boss, string? map)
     {
         var bossName = GetConfigValue(config.BossNames, boss, boss);
         if (string.IsNullOrWhiteSpace(map)) return $"**{bossName}**";
-        var mapDisp = GetConfigValue(config.MapNamesLog, map, map);
-        return $"**{bossName}** on **{mapDisp}**";
+
+        var mapKeys = map.Split([',', '/', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var mapNames = mapKeys.Select(k => GetConfigValue(config.MapNamesLog, k, k)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+        if (mapNames.Count == 0) return $"**{bossName}**";
+        if (mapNames.Count == 1) return $"**{bossName}** on **{mapNames[0]}**";
+
+        return $"**{bossName}** on **{string.Join("** & **", mapNames)}**";
     }
 
     private (List<OnlinePlayer> inRaid, List<OnlinePlayer> tetris) CategorizePlayers(
@@ -679,9 +693,10 @@ public class LogMonitorLite : IDisposable
         ["bossKilla"] = "interchange",
         ["bossKojaniy"] = "woods",
         ["bossSanitar"] = "shoreline",
-        ["bossKolontay"] = "tarkovstreets",
+        ["bossKolontay"] = "tarkovstreets, sandbox_high",
         ["bossKnight"] = "lighthouse",
         ["bossTagilla"] = "factory4_day",
+        ["bossBoar"] = "tarkovstreets",
     };
 
     public LogMonitorLite(string logFolderPath, TimeSpan tzOffset)
@@ -789,8 +804,28 @@ public class LogMonitorLite : IDisposable
             var m = _weeklyBossRegex.Match(line);
             if (m.Success)
             {
-                WeeklyBoss = m.Groups[1].Value;
-                WeeklyBossMap = m.Groups[2].Value;
+                var newBoss = m.Groups[1].Value;
+                var newMap = m.Groups[2].Value;
+
+                // If this boss has known multi-maps containing this map (e.g. Kollontay on Streets & Ground Zero), expand it
+                if (BossToMapKey.TryGetValue(newBoss, out var knownMaps) &&
+                    knownMaps.Contains(newMap, StringComparison.OrdinalIgnoreCase))
+                {
+                    newMap = knownMaps;
+                }
+
+                if (string.Equals(WeeklyBoss, newBoss, StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(WeeklyBossMap))
+                {
+                    var existingMaps = WeeklyBossMap.Split([',', '/', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                    var newMaps = newMap.Split([',', '/', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                    var combined = existingMaps.Union(newMaps, StringComparer.OrdinalIgnoreCase);
+                    WeeklyBossMap = string.Join(", ", combined);
+                }
+                else
+                {
+                    WeeklyBoss = newBoss;
+                    WeeklyBossMap = newMap;
+                }
                 return;
             }
         }
