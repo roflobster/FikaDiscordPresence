@@ -669,8 +669,8 @@ public class LogMonitorLite : IDisposable
     public string? WeeklyBoss { get; private set; }
     public string? WeeklyBossMap { get; private set; }
 
-    private static readonly Regex _weeklyBossRegex = new(@"Weekly Boss:\s+(boss\w+)\s+\|\s+\d+%\s+Chance\s+on\s+(\w+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
-    private static readonly Regex _bossOfTheWeekRegex = new(@"\b(boss\w+)\b\s+is\s+boss\s+of\s+the\s+week\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly Regex _weeklyBossRegex = new(@"(?:Weekly|Daily)\s+Boss:\s+(boss\w+)\s+\|\s+\d+%\s+Chance\s+on\s+(\w+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly Regex _bossOfTheWeekRegex = new(@"\b(boss\w+)\b\s+is\s+boss\s+of\s+the\s+(?:week|day)\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     private static readonly Dictionary<string, string> BossToMapKey = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -722,22 +722,60 @@ public class LogMonitorLite : IDisposable
 
     public void Poll()
     {
-        if (_disposed || _logFilePath == null || !File.Exists(_logFilePath))
+        if (_disposed) return;
+
+        // Check if a newer log file has been created since we started or last checked
+        var latestLog = FindLatestLog();
+        if (latestLog != null && !string.Equals(latestLog, _logFilePath, StringComparison.OrdinalIgnoreCase))
         {
-            if (!_disposed) InitFile();
+            _logFilePath = latestLog;
+            _pos = 0;
+            try
+            {
+                using var fs = new FileStream(_logFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                using var sr = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+
+                string? line;
+                while ((line = sr.ReadLine()) != null)
+                {
+                    if (!string.IsNullOrWhiteSpace(line))
+                        ProcessLine(line, initialLoad: true);
+                }
+
+                _pos = fs.Position;
+                return;
+            }
+            catch
+            {
+                _logFilePath = null;
+                return;
+            }
+        }
+
+        if (_logFilePath == null || !File.Exists(_logFilePath))
+        {
+            InitFile();
             return;
         }
 
         try
         {
             using var fs = new FileStream(_logFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            if (fs.Length < _pos)
+            {
+                // File was truncated or rolled over
+                _pos = 0;
+            }
+
             fs.Seek(_pos, SeekOrigin.Begin);
             using var sr = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true);
             
             string? line;
             while ((line = sr.ReadLine()) != null)
+            {
                 if (!string.IsNullOrWhiteSpace(line))
                     ProcessLine(line, initialLoad: false);
+            }
 
             _pos = fs.Position;
         }
@@ -746,7 +784,7 @@ public class LogMonitorLite : IDisposable
 
     private void ProcessLine(string line, bool initialLoad)
     {
-        if (line.Contains("Weekly Boss:", StringComparison.OrdinalIgnoreCase))
+        if (line.Contains("Boss:", StringComparison.OrdinalIgnoreCase))
         {
             var m = _weeklyBossRegex.Match(line);
             if (m.Success)
@@ -757,13 +795,13 @@ public class LogMonitorLite : IDisposable
             }
         }
 
-        if (line.Contains(" is boss of the week", StringComparison.OrdinalIgnoreCase))
+        if (line.Contains("is boss of the", StringComparison.OrdinalIgnoreCase))
         {
             var m2 = _bossOfTheWeekRegex.Match(line);
-            if (m2.Success && (string.IsNullOrWhiteSpace(WeeklyBoss) || string.IsNullOrWhiteSpace(WeeklyBossMap)))
+            if (m2.Success)
             {
                 WeeklyBoss = m2.Groups[1].Value;
-                WeeklyBossMap = BossToMapKey.TryGetValue(WeeklyBoss, out var mapKey) ? mapKey : null;
+                WeeklyBossMap = BossToMapKey.TryGetValue(m2.Groups[1].Value, out var mapKey) ? mapKey : null;
             }
         }
     }
