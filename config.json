@@ -47,7 +47,12 @@
   "Update": {
     // How often (in seconds) the mod refreshes data and updates the Discord embed.
     // This value IS safe to change live; it takes effect next loop.
-    "IntervalSeconds": 30
+    "IntervalSeconds": 30,
+
+    // Number of consecutive polls a player can be missing from Fika's endpoints
+    // before being considered offline (prevents transient "No one is online" flickers
+    // during raid loading, extraction, or heartbeat gaps).
+    "OfflineGracePolls": 2
   },
 
   "LogMonitor": {

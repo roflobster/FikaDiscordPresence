@@ -125,6 +125,7 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
             string baseUrl = (config.Fika.BaseUrl ?? "").Trim().TrimEnd('/');
             var fikaHeaders = new AuthenticationHeaderValue("Bearer", config.Fika.ApiKey ?? "");
             ModConfig lastConfig = config;
+            var cachedPlayers = new Dictionary<string, CachedPlayerState>(StringComparer.OrdinalIgnoreCase);
 
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -145,6 +146,7 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
                     var players = await GetOnlinePlayers(http, baseUrl, fikaHeaders, cancellationToken);
                     var presence = await GetPresence(http, baseUrl, fikaHeaders, cancellationToken);
                     var presenceByNick = BuildPresenceDict(presence);
+                    players = MergeAndApplyGracePeriod(players, presenceByNick, cachedPlayers, Math.Max(0, config.Update.OfflineGracePolls));
                     var embed = RenderEmbed(config, players, presenceByNick, logMon?.WeeklyBoss, logMon?.WeeklyBossMap);
 
                     statusMessageId = await UpdateDiscordMessage(http, config, embed, statusMessageId, state, statePath, cancellationToken);
@@ -255,6 +257,84 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
                 dict[p.Nickname] = p;
         }
         return dict;
+    }
+
+    private static List<OnlinePlayer> MergeAndApplyGracePeriod(
+        List<OnlinePlayer> apiPlayers,
+        Dictionary<string, PresenceEntry> presenceByNick,
+        Dictionary<string, CachedPlayerState> cachedPlayers,
+        int gracePolls)
+    {
+        var currentByNick = new Dictionary<string, OnlinePlayer>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var p in apiPlayers)
+        {
+            if (!string.IsNullOrWhiteSpace(p.Nickname))
+                currentByNick[p.Nickname] = p;
+        }
+
+        // Cross-check /fika/presence/get so players still reporting presence aren't lost if /fika/api/players drops them
+        foreach (var (nick, pres) in presenceByNick)
+        {
+            if (currentByNick.ContainsKey(nick)) continue;
+
+            int locationId = pres.LocationId
+                ?? (pres.Activity == 1 && cachedPlayers.TryGetValue(nick, out var prev) && prev.Player.LocationId is not (0 or 1)
+                    ? prev.Player.LocationId
+                    : pres.Activity == 3 ? 1 : 0);
+
+            currentByNick[nick] = new OnlinePlayer
+            {
+                ProfileId = cachedPlayers.TryGetValue(nick, out var cached) ? cached.Player.ProfileId : "",
+                Nickname = pres.Nickname,
+                LocationId = locationId
+            };
+        }
+
+        // Update cache for all players seen in either endpoint this poll
+        foreach (var (nick, player) in currentByNick)
+        {
+            presenceByNick.TryGetValue(nick, out var pres);
+            if (cachedPlayers.TryGetValue(nick, out var existing))
+            {
+                existing.Player = player;
+                if (pres != null) existing.Presence = pres;
+                existing.MissedPolls = 0;
+            }
+            else
+            {
+                cachedPlayers[nick] = new CachedPlayerState
+                {
+                    Player = player,
+                    Presence = pres,
+                    MissedPolls = 0
+                };
+            }
+        }
+
+        // Apply grace period for players who temporarily disappeared from both endpoints
+        var expiredNicks = new List<string>();
+        foreach (var (nick, cached) in cachedPlayers)
+        {
+            if (currentByNick.ContainsKey(nick)) continue;
+
+            cached.MissedPolls++;
+            if (cached.MissedPolls <= gracePolls)
+            {
+                currentByNick[nick] = cached.Player;
+                if (cached.Presence != null && !presenceByNick.ContainsKey(nick))
+                    presenceByNick[nick] = cached.Presence;
+            }
+            else
+            {
+                expiredNicks.Add(nick);
+            }
+        }
+
+        foreach (var nick in expiredNicks)
+            cachedPlayers.Remove(nick);
+
+        return currentByNick.Values.ToList();
     }
 
     private static string GetDefaultLogFolderFromModPath(string pathToMod)
@@ -484,11 +564,16 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
                     var started = el.TryGetProperty("activityStartedTimestamp", out var sEl) ? sEl.GetInt64() : 0;
 
                     int? side = null;
+                    int? locationId = null;
                     if (el.TryGetProperty("raidInformation", out var rEl) && rEl.ValueKind == JsonValueKind.Object)
+                    {
                         if (rEl.TryGetProperty("side", out var sideEl) && sideEl.ValueKind is JsonValueKind.Number)
                             side = sideEl.GetInt32();
+                        if (rEl.TryGetProperty("location", out var locEl) && locEl.ValueKind is JsonValueKind.Number)
+                            locationId = locEl.GetInt32();
+                    }
 
-                    outList.Add(new() { Nickname = nick, Level = level, Activity = activity, ActivityStartedTimestamp = started, Side = side });
+                    outList.Add(new() { Nickname = nick, Level = level, Activity = activity, ActivityStartedTimestamp = started, Side = side, LocationId = locationId });
                 }
                 catch { }
             }
@@ -600,7 +685,11 @@ public record FikaConfig
     public string ApiKey { get; set; } = "";
 }
 
-public record UpdateConfig { public int IntervalSeconds { get; set; } = 30; }
+public record UpdateConfig
+{
+    public int IntervalSeconds { get; set; } = 30;
+    public int OfflineGracePolls { get; set; } = 2;
+}
 public record LogMonitorConfig { public bool Enabled { get; set; }  public int TimezoneOffsetHours { get; set; } public string? LogFolderPath { get; set; } }
 
 public record TextConfig
@@ -640,6 +729,14 @@ public class PresenceEntry
     public int Activity { get; set; }
     public long ActivityStartedTimestamp { get; set; }
     public int? Side { get; set; }
+    public int? LocationId { get; set; }
+}
+
+public class CachedPlayerState
+{
+    public OnlinePlayer Player { get; set; } = new();
+    public PresenceEntry? Presence { get; set; }
+    public int MissedPolls { get; set; }
 }
 
 public class WebhookSendPayload
