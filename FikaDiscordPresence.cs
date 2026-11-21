@@ -19,7 +19,7 @@ public record ModMetadata : IModMetadata
     public string Name { get; init; } = "Fika Discord Presence";
     public string Author { get; init; } = "Fiodor";
     public List<string>? Contributors { get; init; }
-    public SemanticVersioning.Version Version { get; init; } = new("1.0.4");
+    public SemanticVersioning.Version Version { get; init; } = new("1.0.5");
     public SemanticVersioning.Range SptVersion { get; init; } = new("~4.1.0");
     public bool HasPrepatcher { get; init; } = false;
     public List<string>? Incompatibilities { get; init; }
@@ -146,7 +146,7 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
                     var players = await GetOnlinePlayers(http, baseUrl, fikaHeaders, cancellationToken);
                     var presence = await GetPresence(http, baseUrl, fikaHeaders, cancellationToken);
                     var presenceByNick = BuildPresenceDict(presence);
-                    players = MergeAndApplyGracePeriod(players, presenceByNick, cachedPlayers, Math.Max(0, config.Update.OfflineGracePolls));
+                    players = MergeAndApplyGracePeriod(players, presenceByNick, cachedPlayers, Math.Max(0, config.Update.OfflineGracePolls), logMon?.LastGeneratedLocationId);
                     var embed = RenderEmbed(config, players, presenceByNick, logMon?.WeeklyBoss, logMon?.WeeklyBossMap);
 
                     statusMessageId = await UpdateDiscordMessage(http, config, embed, statusMessageId, state, statePath, cancellationToken);
@@ -263,7 +263,8 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
         List<OnlinePlayer> apiPlayers,
         Dictionary<string, PresenceEntry> presenceByNick,
         Dictionary<string, CachedPlayerState> cachedPlayers,
-        int gracePolls)
+        int gracePolls,
+        int? lastGeneratedLocationId)
     {
         var currentByNick = new Dictionary<string, OnlinePlayer>(StringComparer.OrdinalIgnoreCase);
 
@@ -291,6 +292,45 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
             };
         }
 
+        // Handle Map-to-Map Transit where Fika sets location=0 and raidInformation=null while activity remains 1 (In Raid)
+        foreach (var (nick, player) in currentByNick)
+        {
+            if (!presenceByNick.TryGetValue(nick, out var pres) || pres.Activity != 1)
+                continue;
+
+            cachedPlayers.TryGetValue(nick, out var prev);
+
+            // Preserve PMC/Scav side across transit raids when raidInformation is null
+            if (pres.Side is null && prev?.Presence?.Side is not null)
+                pres.Side = prev.Presence.Side;
+
+            // Resolve map location if Fika reported location 0/1 during a transit raid
+            if (player.LocationId is 0 or 1)
+            {
+                if (pres.LocationId is > 1)
+                {
+                    player.LocationId = pres.LocationId.Value;
+                }
+                else if (prev != null && prev.TransitActivityTimestamp == pres.ActivityStartedTimestamp && prev.TransitLocationId is > 1)
+                {
+                    player.LocationId = prev.TransitLocationId.Value;
+                }
+                else if (lastGeneratedLocationId is > 1)
+                {
+                    player.LocationId = lastGeneratedLocationId.Value;
+                    if (prev != null)
+                    {
+                        prev.TransitLocationId = lastGeneratedLocationId.Value;
+                        prev.TransitActivityTimestamp = pres.ActivityStartedTimestamp;
+                    }
+                }
+                else if (prev != null && prev.Player.LocationId is not (0 or 1))
+                {
+                    player.LocationId = prev.Player.LocationId;
+                }
+            }
+        }
+
         // Update cache for all players seen in either endpoint this poll
         foreach (var (nick, player) in currentByNick)
         {
@@ -307,7 +347,9 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
                 {
                     Player = player,
                     Presence = pres,
-                    MissedPolls = 0
+                    MissedPolls = 0,
+                    TransitLocationId = pres?.Activity == 1 && player.LocationId > 1 ? player.LocationId : null,
+                    TransitActivityTimestamp = pres?.ActivityStartedTimestamp ?? 0
                 };
             }
         }
@@ -569,8 +611,15 @@ public class ReadJsonConfig(ISptLogger<ReadJsonConfig> logger, ModHelper modHelp
                     {
                         if (rEl.TryGetProperty("side", out var sideEl) && sideEl.ValueKind is JsonValueKind.Number)
                             side = sideEl.GetInt32();
-                        if (rEl.TryGetProperty("location", out var locEl) && locEl.ValueKind is JsonValueKind.Number)
-                            locationId = locEl.GetInt32();
+                        if (rEl.TryGetProperty("location", out var locEl))
+                        {
+                            if (locEl.ValueKind is JsonValueKind.Number)
+                                locationId = locEl.GetInt32();
+                            else if (locEl.ValueKind is JsonValueKind.String &&
+                                     locEl.GetString() is { } locStr &&
+                                     LogMonitorLite.MapKeyToLocationId.TryGetValue(locStr, out var mappedLocId))
+                                locationId = mappedLocId;
+                        }
                     }
 
                     outList.Add(new() { Nickname = nick, Level = level, Activity = activity, ActivityStartedTimestamp = started, Side = side, LocationId = locationId });
@@ -737,6 +786,8 @@ public class CachedPlayerState
     public OnlinePlayer Player { get; set; } = new();
     public PresenceEntry? Presence { get; set; }
     public int MissedPolls { get; set; }
+    public int? TransitLocationId { get; set; }
+    public long TransitActivityTimestamp { get; set; }
 }
 
 public class WebhookSendPayload
@@ -779,9 +830,28 @@ public class LogMonitorLite : IDisposable
 
     public string? WeeklyBoss { get; private set; }
     public string? WeeklyBossMap { get; private set; }
+    public int? LastGeneratedLocationId { get; private set; }
 
     private static readonly Regex _weeklyBossRegex = new(@"(?:Weekly|Daily)\s+Boss:\s+(boss\w+)\s+\|\s+\d+%\s+Chance\s+on\s+(\w+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
     private static readonly Regex _bossOfTheWeekRegex = new(@"\b(boss\w+)\b\s+is\s+boss\s+of\s+the\s+(?:week|day)\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+    private static readonly Regex _generatedLocationRegex = new(@"Generated\s+location:\s+(\w+)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    public static readonly Dictionary<string, int> MapKeyToLocationId = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["factory4_day"] = 2,
+        ["factory4_night"] = 2,
+        ["bigmap"] = 3,
+        ["woods"] = 4,
+        ["shoreline"] = 5,
+        ["interchange"] = 6,
+        ["rezervbase"] = 7,
+        ["tarkovstreets"] = 8,
+        ["lighthouse"] = 9,
+        ["sandbox"] = 10,
+        ["sandbox_high"] = 10,
+        ["laboratory"] = 11,
+        ["labyrinth"] = 12,
+    };
 
     private static readonly Dictionary<string, string> BossToMapKey = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -896,6 +966,16 @@ public class LogMonitorLite : IDisposable
 
     private void ProcessLine(string line, bool initialLoad)
     {
+        if (line.Contains("Generated location:", StringComparison.OrdinalIgnoreCase))
+        {
+            var mLoc = _generatedLocationRegex.Match(line);
+            if (mLoc.Success && MapKeyToLocationId.TryGetValue(mLoc.Groups[1].Value, out var locId))
+            {
+                LastGeneratedLocationId = locId;
+                return;
+            }
+        }
+
         if (line.Contains("Boss:", StringComparison.OrdinalIgnoreCase))
         {
             var m = _weeklyBossRegex.Match(line);
